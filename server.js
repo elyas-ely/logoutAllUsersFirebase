@@ -15,7 +15,7 @@ app.use(express.json());
 
 // ⚠️ ENABLE THIS ONLY WHEN YOU WANT TO RUN THE LOGOUT PROCESS
 // Change this to true to enable the logout endpoint
-const LOGOUT_ENABLED = false;
+const LOGOUT_ENABLED = true;
 
 // Secret key for simple authentication (optional but recommended)
 // Pass this as a query param ?key=YOUR_SECRET_KEY or header x-api-key
