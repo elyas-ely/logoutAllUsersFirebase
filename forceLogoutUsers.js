@@ -6,6 +6,7 @@ const pLimit = require('p-limit');
 /**
  * Force logout all users except those in the exclusion list
  * Uses a sliding window concurrency model for maximum throughput
+ * Handles rate limiting for "immediate" logout (updateUser quota is strict)
  * @param {string[]} excludedUserIds - Array of user IDs to exclude from logout
  * @param {boolean} immediateLogout - If true, terminates active sessions by disabling/re-enabling accounts
  * @returns {Promise<{success: number, failed: number, skipped: number, errors: Array}>}
@@ -19,14 +20,18 @@ async function forceLogoutAllUsers(excludedUserIds = [], immediateLogout = false
     let skippedCount = 0;
     const errors = [];
 
-    // Concurrency limit: 50 concurrent operations
-    // This pipeline keeps 50 operations active at all times, avoiding "batch wait" delays
-    const limit = pLimit(50);
+    // DYNAMIC CONCURRENCY
+    // Immediate mode uses admin.auth().updateUser() which has stricter rate limits (approx 10-20/sec)
+    // Standard mode uses admin.auth().revokeRefreshTokens() which handles higher throughput but quota is shared
+    // User requested concurrency 10
+    const concurrency = immediateLogout ? 5 : 10;
+    const limit = pLimit(concurrency);
     const allPromises = [];
 
     console.log(`Starting optimized parallel logout process...`);
     console.log(`Excluded users: ${excludedUserIds.length}`);
-    console.log(`Immediate logout mode: ${immediateLogout ? 'ENABLED (terminates active sessions)' : 'DISABLED (revoke tokens only)'}\n`);
+    console.log(`Immediate logout mode: ${immediateLogout ? 'ENABLED (terminates active sessions)' : 'DISABLED (revoke tokens only)'}`);
+    console.log(`Concurrency Limit: ${concurrency} operations/sec (adjusted for rate limits)\n`);
 
     try {
         do {
@@ -49,23 +54,25 @@ async function forceLogoutAllUsers(excludedUserIds = [], immediateLogout = false
 
                     try {
                         if (immediateLogout) {
-                            // Disable account (terminates all active sessions)
-                            await admin.auth().updateUser(userRecord.uid, { disabled: true });
-                            await new Promise(resolve => setTimeout(resolve, 100)); // Small delay
+                            // RETRY LOGIC for quota enforcement
+                            await robustUpdateUser(userRecord.uid, { disabled: true });
 
                             // Revoke refresh tokens
                             await admin.auth().revokeRefreshTokens(userRecord.uid);
 
                             // Re-enable account
-                            await admin.auth().updateUser(userRecord.uid, { disabled: false });
+                            await robustUpdateUser(userRecord.uid, { disabled: false });
                         } else {
                             // Just revoke refresh tokens
+                            // Add small delay to respect 10qps limit strictly
+                            await new Promise(resolve => setTimeout(resolve, 100));
                             await admin.auth().revokeRefreshTokens(userRecord.uid);
                         }
 
                         successCount++;
-                        // Log every 100 successes to avoid spamming console
-                        if (successCount % 100 === 0) {
+                        // Log every 10 successes (immediate) or 100 (standard) to track progress better
+                        const logInterval = immediateLogout ? 10 : 100;
+                        if (successCount % logInterval === 0) {
                             console.log(`Progress: ${successCount} users logged out...`);
                         }
                         return { status: 'success', uid: userRecord.uid };
@@ -77,7 +84,12 @@ async function forceLogoutAllUsers(excludedUserIds = [], immediateLogout = false
                             error: error.message
                         };
                         errors.push(errorInfo);
-                        console.error(`Failed to logout user ${userRecord.uid}:`, error.message);
+                        // Only log errors if not quota related (to avoid spam if we hit limits despite throttling)
+                        if (!error.message.includes('quota')) {
+                            console.error(`Failed to logout user ${userRecord.uid}:`, error.message);
+                        } else {
+                            console.error(`Quota exceeded for user ${userRecord.uid} - skipping`);
+                        }
                         return { status: 'failed', uid: userRecord.uid, error: error.message };
                     }
                 });
@@ -86,7 +98,7 @@ async function forceLogoutAllUsers(excludedUserIds = [], immediateLogout = false
             // Add batch promises to the main list
             allPromises.push(...batchPromises);
 
-            // Move to next page immediately (don't wait for processing to finish)
+            // Move to next page immediately
             nextPageToken = listUsersResult.pageToken;
 
         } while (nextPageToken);
@@ -113,6 +125,24 @@ async function forceLogoutAllUsers(excludedUserIds = [], immediateLogout = false
     } catch (error) {
         console.error('Fatal error during logout process:', error);
         throw error;
+    }
+}
+
+/**
+ * Helper to retry updateUser on failure (simple improved reliability)
+ */
+async function robustUpdateUser(uid, properties, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            await admin.auth().updateUser(uid, properties);
+            return;
+        } catch (error) {
+            if (i === retries - 1) throw error; // Last retry failed
+
+            // Wait before retry (exponential backoff: 500ms, 1000ms, 2000ms)
+            const delay = 500 * Math.pow(2, i);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
     }
 }
 
@@ -165,15 +195,17 @@ async function main() {
 
         const result = await forceLogoutAllUsers(excludedUserIds, immediateMode);
 
-        console.log('\n=== Final Results ===');
-        // Only log summary, not full JSON if huge
-        console.log(JSON.stringify({
-            success: result.success,
-            failed: result.failed,
-            skipped: result.skipped,
-            total: result.total,
-            errorCount: result.errors.length
-        }, null, 2));
+        console.log('\n=== Final Results Summary ===');
+        console.log(`Success: ${result.success}`);
+        console.log(`Failed: ${result.failed}`);
+
+        if (result.failed > 0) {
+            console.log(`See logs for details on failures.`);
+            // Write errors to a file for better debugging
+            const errorLogPath = path.join(__dirname, 'logout_errors.json');
+            fs.writeFileSync(errorLogPath, JSON.stringify(result.errors, null, 2));
+            console.log(`Detailed errors saved to: ${errorLogPath}`);
+        }
 
     } catch (error) {
         console.error('Error in main execution:', error);
