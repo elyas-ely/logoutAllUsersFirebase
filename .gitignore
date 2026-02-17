@@ -2,4 +2,4 @@ node_modules/
 .env
 service.json
 *.log
-package-lock.json
+
